@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/oxystudio-core", "crates/oxystudio"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["OxyStudio contributors"]
+repository = "https://github.com/crisprintsstuff/Oxy-Launcher"
+rust-version = "1.85"
+description = "Desktop launcher and updater for Oxy applications"
+
+[workspace.dependencies]
+dirs = "7.0.0"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+thiserror = "2"
+ureq = { version = "2.12.1", default-features = false, features = ["tls", "json"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wgpu"] }
+egui = "0.31.1"
+log = "0.4"
+env_logger = "0.11"
+tempfile = "3"
+
+[profile.release]
+strip = "symbols"
+lto = false
+codegen-units = 16
