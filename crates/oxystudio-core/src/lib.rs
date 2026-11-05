@@ -2,6 +2,7 @@
 
 pub mod app_info;
 pub mod checksum;
+pub mod detector;
 pub mod error;
 pub mod github;
 pub mod installer;
@@ -10,6 +11,7 @@ pub mod manifest;
 pub mod version;
 
 pub use app_info::AppId;
+pub use detector::{AppDetector, DetectedApp, DetectionSource};
 pub use error::{Error, Result};
 pub use github::{Asset, GitHubClient, Release};
 pub use installer::{InstallProgress, InstallStage, Installer, ProgressCallback};

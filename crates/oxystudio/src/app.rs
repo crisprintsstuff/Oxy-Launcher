@@ -3,11 +3,38 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
-use egui::{vec2, Align, Color32, CornerRadius, Layout, Margin, RichText};
+use egui::{vec2, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
 use oxystudio_core::{
-    AppId, GitHubClient, InstallProgress, Installer, Launcher, Manifest, Release,
+    AppDetector, AppId, DetectedApp, GitHubClient, InstallProgress, Installer, Launcher, Manifest,
+    Release, Version,
 };
 use serde::{Deserialize, Serialize};
+
+// ── BozNetwork Portal / Liquid Glass Design Tokens ──
+const COLOR_BG: Color32 = Color32::from_rgb(7, 14, 26); // #070e1a
+const COLOR_BG_APPBAR: Color32 = Color32::from_rgb(10, 21, 40); // #0a1528
+const COLOR_BG_CARD: Color32 = Color32::from_rgb(16, 36, 64); // rgba(16, 36, 64, 0.45)
+const COLOR_BG_CARD_HOVER: Color32 = Color32::from_rgb(22, 48, 82);
+const COLOR_BORDER: Color32 = Color32::from_rgba_premultiplied(160, 190, 220, 32);
+const COLOR_BORDER_STRONG: Color32 = Color32::from_rgba_premultiplied(160, 190, 220, 64);
+
+const COLOR_TEXT: Color32 = Color32::from_rgb(238, 243, 249); // #eef3f9
+const COLOR_MUTED: Color32 = Color32::from_rgb(158, 180, 201); // #9eb4c9
+const COLOR_DIM: Color32 = Color32::from_rgb(109, 132, 153); // #6d8499
+
+const COLOR_BLUE_BRIGHT: Color32 = Color32::from_rgb(43, 143, 212); // #2b8fd4 (Boz Blue)
+const COLOR_ORANGE_BRIGHT: Color32 = Color32::from_rgb(240, 138, 26); // #f08a1a (Boz Orange)
+const COLOR_GREEN_STATUS: Color32 = Color32::from_rgb(61, 155, 122); // #3d9b7a
+const COLOR_RED_STATUS: Color32 = Color32::from_rgb(196, 92, 74); // #c45c4a
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortalTab {
+    Today,
+    Apps,
+    OxyBrush,
+    OxyPixel,
+    Settings,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LauncherSettings {
@@ -62,6 +89,10 @@ pub enum LauncherEvent {
         app_id: AppId,
         releases: Vec<Release>,
     },
+    AppDetected {
+        app_id: AppId,
+        detected: DetectedApp,
+    },
     FetchFailed {
         app_id: AppId,
         error: String,
@@ -101,9 +132,8 @@ pub struct AppCardState {
 }
 
 pub struct OxyStudioApp {
+    current_tab: PortalTab,
     settings: LauncherSettings,
-    settings_open: bool,
-    selected_app: AppId,
     apps: HashMap<AppId, AppCardState>,
     manifest: Manifest,
     installer: Installer,
@@ -133,9 +163,8 @@ impl OxyStudioApp {
         }
 
         let mut app = Self {
+            current_tab: PortalTab::Today,
             settings,
-            settings_open: false,
-            selected_app: AppId::OxyBrush,
             apps,
             manifest,
             installer,
@@ -145,8 +174,9 @@ impl OxyStudioApp {
             global_status: None,
         };
 
-        // Trigger initial releases fetch
+        // Trigger initial releases fetch and system auto-discovery
         app.refresh_all_releases();
+        app.scan_system_for_installed_apps();
 
         app
     }
@@ -176,6 +206,58 @@ impl OxyStudioApp {
                     }
                 }
             });
+        }
+    }
+
+    fn scan_system_for_installed_apps(&mut self) {
+        self.global_status = Some("Scanning system for installed Oxy applications...".to_string());
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            for &app_id in AppId::ALL {
+                if let Some(detected) = AppDetector::detect(app_id) {
+                    let _ = tx.send(LauncherEvent::AppDetected { app_id, detected });
+                }
+            }
+        });
+    }
+
+    fn locate_app_manually(&mut self, app_id: AppId) {
+        let dialog = rfd::FileDialog::new().set_title(format!("Locate {}", app_id.display_name()));
+
+        #[cfg(target_os = "windows")]
+        let dialog = dialog.add_filter("Executable", &["exe"]);
+
+        if let Some(path) = dialog.pick_file() {
+            if path.is_file() {
+                let install_dir = path.parent().unwrap_or(&path).to_path_buf();
+                let version = AppDetector::probe_version(&path)
+                    .unwrap_or_else(|| Version::new(0, 0, 0, Some("manual".to_string())));
+
+                self.manifest.register(
+                    app_id,
+                    version.clone(),
+                    "manually located".to_string(),
+                    path.clone(),
+                    install_dir,
+                );
+                let _ = self.installer.save_manifest(&self.manifest);
+
+                if let Some(card) = self.apps.get_mut(&app_id) {
+                    card.status_message = Some(format!(
+                        "Linked executable: {} (v{})",
+                        path.display(),
+                        version
+                    ));
+                }
+            }
+        }
+    }
+
+    fn unlink_app(&mut self, app_id: AppId) {
+        self.manifest.remove(app_id);
+        let _ = self.installer.save_manifest(&self.manifest);
+        if let Some(card) = self.apps.get_mut(&app_id) {
+            card.status_message = Some("Unlinked application from launcher.".to_string());
         }
     }
 
@@ -268,6 +350,37 @@ impl OxyStudioApp {
                     }
                     self.global_status = None;
                 }
+                LauncherEvent::AppDetected { app_id, detected } => {
+                    let should_register = match self.manifest.get(app_id) {
+                        Some(existing) => !existing.is_valid(),
+                        None => true,
+                    };
+
+                    if should_register {
+                        let version = detected
+                            .version
+                            .clone()
+                            .unwrap_or_else(|| Version::new(0, 0, 0, Some("detected".to_string())));
+                        let tag = format!("detected ({})", detected.source);
+                        self.manifest.register(
+                            app_id,
+                            version,
+                            tag,
+                            detected.executable_path.clone(),
+                            detected.install_dir.clone(),
+                        );
+                        let _ = self.installer.save_manifest(&self.manifest);
+
+                        if let Some(card) = self.apps.get_mut(&app_id) {
+                            card.status_message = Some(format!(
+                                "Located {} via {}",
+                                app_id.display_name(),
+                                detected.source
+                            ));
+                        }
+                    }
+                    self.global_status = None;
+                }
                 LauncherEvent::FetchFailed { app_id, error } => {
                     if let Some(card) = self.apps.get_mut(&app_id) {
                         card.is_fetching = false;
@@ -339,59 +452,108 @@ impl eframe::App for OxyStudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
 
-        // Any active downloads/installations require continuous repaint
-        let any_installing = self.apps.values().any(|c| c.is_installing || c.is_fetching);
-        if any_installing {
+        let any_busy = self.apps.values().any(|c| c.is_installing || c.is_fetching);
+        if any_busy {
             ctx.request_repaint();
         }
 
-        // Configure theme / style
+        // Apply BozNetwork Liquid Glass dark navy theme
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(20, 22, 28);
-        visuals.window_fill = Color32::from_rgb(26, 29, 36);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(28, 31, 40);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(36, 40, 52);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(48, 54, 70);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(56, 64, 82);
-        visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
-        visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
-        visuals.widgets.active.corner_radius = CornerRadius::same(6);
+        visuals.panel_fill = COLOR_BG;
+        visuals.window_fill = COLOR_BG_APPBAR;
+        visuals.widgets.noninteractive.bg_fill = COLOR_BG_CARD;
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(18, 38, 68);
+        visuals.widgets.hovered.bg_fill = COLOR_BG_CARD_HOVER;
+        visuals.widgets.active.bg_fill = Color32::from_rgb(28, 60, 102);
+        visuals.widgets.inactive.corner_radius = CornerRadius::same(16);
+        visuals.widgets.hovered.corner_radius = CornerRadius::same(16);
+        visuals.widgets.active.corner_radius = CornerRadius::same(16);
         ctx.set_visuals(visuals);
 
-        // Top Navigation Bar
-        egui::TopBottomPanel::top("header_bar")
+        // ── Top Glass Appbar with Capsule Tabs ──
+        egui::TopBottomPanel::top("appbar")
             .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .fill(Color32::from_rgb(16, 18, 24))
-                    .inner_margin(Margin::symmetric(20, 14)),
+                Frame::side_top_panel(&ctx.style())
+                    .fill(COLOR_BG_APPBAR)
+                    .stroke(Stroke::new(1.0_f32, COLOR_BORDER))
+                    .inner_margin(Margin::symmetric(24, 12)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading(
-                        RichText::new("✦ Oxy Studio")
-                            .color(Color32::from_rgb(56, 189, 248))
-                            .size(20.0)
+                    // Brand Mark & Title
+                    ui.label(
+                        RichText::new("✦")
+                            .color(COLOR_BLUE_BRIGHT)
+                            .size(24.0)
                             .strong(),
                     );
-                    ui.label(
-                        RichText::new("Creative Tools Hub")
-                            .color(Color32::from_rgb(140, 150, 170))
-                            .size(13.0),
-                    );
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(
+                                RichText::new("OXY STUDIO")
+                                    .color(COLOR_TEXT)
+                                    .size(17.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new("PORTAL")
+                                    .color(COLOR_ORANGE_BRIGHT)
+                                    .size(12.0)
+                                    .strong(),
+                            );
+                        });
+                        ui.label(
+                            RichText::new("Creative Suite & Tools Hub")
+                                .color(COLOR_MUTED)
+                                .size(11.0),
+                        );
+                    });
 
+                    ui.add_space(28.0);
+
+                    // Capsule Navigation Chips (Boz App Store style)
+                    self.draw_capsule_tabs(ui);
+
+                    // Right utility actions
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button(RichText::new("⚙ Settings").size(13.0)).clicked() {
-                            self.settings_open = !self.settings_open;
+                        if ui
+                            .button(RichText::new("⚙ Settings").size(12.5).color(
+                                if self.current_tab == PortalTab::Settings {
+                                    COLOR_BLUE_BRIGHT
+                                } else {
+                                    COLOR_MUTED
+                                },
+                            ))
+                            .clicked()
+                        {
+                            self.current_tab = PortalTab::Settings;
+                        }
+
+                        if ui
+                            .button(
+                                RichText::new("🔍 Scan System")
+                                    .size(12.5)
+                                    .color(COLOR_MUTED),
+                            )
+                            .clicked()
+                        {
+                            self.scan_system_for_installed_apps();
                         }
 
                         let is_busy = self.apps.values().any(|c| c.is_fetching);
                         let refresh_btn = if is_busy {
                             ui.add_enabled(
                                 false,
-                                egui::Button::new(RichText::new("⟳ Checking...").size(13.0)),
+                                egui::Button::new(
+                                    RichText::new("⟳ Checking...").size(12.5).color(COLOR_DIM),
+                                ),
                             )
                         } else {
-                            ui.button(RichText::new("⟳ Refresh Releases").size(13.0))
+                            ui.button(
+                                RichText::new("⟳ Refresh")
+                                    .size(12.5)
+                                    .color(COLOR_BLUE_BRIGHT),
+                            )
                         };
 
                         if refresh_btn.clicked() {
@@ -401,191 +563,56 @@ impl eframe::App for OxyStudioApp {
                 });
             });
 
-        // Bottom Status Bar
+        // ── Bottom Status Bar ──
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .fill(Color32::from_rgb(14, 16, 20))
-                    .inner_margin(Margin::symmetric(16, 6)),
+                Frame::side_top_panel(&ctx.style())
+                    .fill(Color32::from_rgb(5, 10, 18))
+                    .inner_margin(Margin::symmetric(24, 6)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(status) = &self.global_status {
-                        ui.label(
-                            RichText::new(status)
-                                .color(Color32::from_rgb(56, 189, 248))
-                                .size(11.0),
-                        );
+                        ui.label(RichText::new(status).color(COLOR_BLUE_BRIGHT).size(11.0));
                     } else {
+                        let installed_count = self.manifest.apps.len();
                         ui.label(
-                            RichText::new("Connected to GitHub API")
-                                .color(Color32::from_rgb(90, 100, 120))
-                                .size(11.0),
+                            RichText::new(format!(
+                                "BozNetwork Portal Engine • {} app{} connected",
+                                installed_count,
+                                if installed_count == 1 { "" } else { "s" }
+                            ))
+                            .color(COLOR_DIM)
+                            .size(11.0),
                         );
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new("v0.1.0")
-                                .color(Color32::from_rgb(80, 90, 110))
+                            RichText::new("OxyStudio v0.1.0")
+                                .color(COLOR_DIM)
                                 .size(11.0),
                         );
                     });
                 });
             });
 
-        // Left App Selector Sidebar
-        egui::SidePanel::left("apps_sidebar")
-            .resizable(false)
-            .exact_width(220.0)
-            .frame(
-                egui::Frame::side_top_panel(&ctx.style())
-                    .fill(Color32::from_rgb(22, 25, 33))
-                    .inner_margin(Margin::symmetric(12, 16)),
-            )
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("APPLICATIONS")
-                        .size(11.0)
-                        .color(Color32::from_rgb(110, 120, 140))
-                        .strong(),
-                );
-                ui.add_space(8.0);
-
-                for &app_id in AppId::ALL {
-                    let is_selected = self.selected_app == app_id;
-                    let installed = self.manifest.get(app_id).is_some();
-
-                    let text_color = if is_selected {
-                        Color32::from_rgb(255, 255, 255)
-                    } else {
-                        Color32::from_rgb(170, 180, 200)
-                    };
-
-                    let icon = match app_id {
-                        AppId::OxyBrush => "🖌",
-                        AppId::OxyPixel => "▦",
-                    };
-
-                    let label = format!("{} {}", icon, app_id.display_name());
-                    let mut btn = egui::Button::new(
-                        RichText::new(label).color(text_color).size(14.0).strong(),
-                    )
-                    .min_size(vec2(196.0, 36.0));
-
-                    if is_selected {
-                        btn = btn.fill(Color32::from_rgb(45, 55, 75));
-                    }
-
-                    if ui.add(btn).clicked() {
-                        self.selected_app = app_id;
-                    }
-
-                    // Small indicator badge
-                    ui.horizontal(|ui| {
-                        ui.add_space(32.0);
-                        if installed {
-                            ui.label(
-                                RichText::new("● Installed")
-                                    .color(Color32::from_rgb(34, 197, 94))
-                                    .size(10.0),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("○ Available")
-                                    .color(Color32::from_rgb(120, 130, 150))
-                                    .size(10.0),
-                            );
-                        }
-                    });
-
-                    ui.add_space(4.0);
-                }
-            });
-
-        // Central Panel: Selected App Detail Card
+        // ── Main Content Area ──
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::central_panel(&ctx.style())
-                    .fill(Color32::from_rgb(26, 29, 38))
-                    .inner_margin(Margin::same(24)),
+                Frame::central_panel(&ctx.style())
+                    .fill(COLOR_BG)
+                    .inner_margin(Margin::same(28)),
             )
             .show(ctx, |ui| {
-                self.show_app_detail(ui, self.selected_app);
-            });
-
-        // Settings Window
-        if self.settings_open {
-            let mut open = true;
-            let mut close_clicked = false;
-            egui::Window::new("Settings")
-                .resizable(false)
-                .collapsible(false)
-                .open(&mut open)
-                .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-                .min_width(420.0)
-                .show(ctx, |ui| {
-                    ui.add_space(8.0);
-                    ui.heading("Launcher Configuration");
-                    ui.add_space(12.0);
-
-                    if ui
-                        .checkbox(
-                            &mut self.settings.allow_prereleases,
-                            "Include Pre-releases (Alphas, Betas, Release Candidates)",
-                        )
-                        .changed()
-                    {
-                        self.settings.save();
-                    }
-
-                    if ui
-                        .checkbox(
-                            &mut self.settings.auto_check_updates,
-                            "Check for updates automatically on start",
-                        )
-                        .changed()
-                    {
-                        self.settings.save();
-                    }
-
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new("Apps Installation Directory:")
-                            .size(12.0)
-                            .strong(),
-                    );
-                    let (default_apps, _) = Installer::default_paths();
-                    let current_dir = self
-                        .settings
-                        .custom_apps_dir
-                        .as_ref()
-                        .unwrap_or(&default_apps);
-
-                    ui.label(
-                        RichText::new(current_dir.display().to_string())
-                            .color(Color32::from_rgb(160, 170, 190))
-                            .monospace()
-                            .size(11.0),
-                    );
-
-                    ui.add_space(8.0);
-                    if ui.button("📂 Open Apps Folder").clicked() {
-                        Self::open_directory(current_dir);
-                    }
-
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
-                        close_clicked = true;
-                    }
+                egui::ScrollArea::vertical().show(ui, |ui| match self.current_tab {
+                    PortalTab::Today => self.show_today_view(ui),
+                    PortalTab::Apps => self.show_apps_view(ui),
+                    PortalTab::OxyBrush => self.show_app_page(ui, AppId::OxyBrush),
+                    PortalTab::OxyPixel => self.show_app_page(ui, AppId::OxyPixel),
+                    PortalTab::Settings => self.show_settings_view(ui),
                 });
-            if close_clicked {
-                open = false;
-            }
-            self.settings_open = open;
-        }
+            });
 
         // Release Notes Modal
         if let Some((app_id, release)) = self.release_notes_modal.clone() {
@@ -596,15 +623,15 @@ impl eframe::App for OxyStudioApp {
                 release.tag_name
             ))
             .open(&mut open)
-            .min_width(520.0)
+            .min_width(540.0)
             .max_height(480.0)
             .show(ctx, |ui| {
                 ui.heading(release.display_title());
                 if let Some(published) = &release.published_at {
                     ui.label(
                         RichText::new(format!("Published: {}", published))
-                            .size(11.0)
-                            .color(Color32::from_rgb(140, 150, 170)),
+                            .size(11.5)
+                            .color(COLOR_MUTED),
                     );
                 }
                 ui.add_space(10.0);
@@ -628,290 +655,132 @@ impl eframe::App for OxyStudioApp {
 }
 
 impl OxyStudioApp {
-    fn show_app_detail(&mut self, ui: &mut egui::Ui, app_id: AppId) {
-        let card = self.apps.get(&app_id).cloned().unwrap_or_default();
-        let installed = self.manifest.get(app_id).cloned();
+    fn draw_capsule_tabs(&mut self, ui: &mut egui::Ui) {
+        let tabs = [
+            (PortalTab::Today, "Today"),
+            (PortalTab::Apps, "All Tools"),
+            (PortalTab::OxyBrush, "OxyBrush"),
+            (PortalTab::OxyPixel, "OxyPixel"),
+        ];
 
-        // Find applicable release (respecting settings.allow_prereleases)
-        let latest_release = card
-            .releases
-            .iter()
-            .find(|r| self.settings.allow_prereleases || !r.prerelease)
-            .cloned();
-
-        // 1. Header with App Name, Tagline, and Status
-        ui.horizontal(|ui| {
-            let (icon, color) = match app_id {
-                AppId::OxyBrush => ("🖌", Color32::from_rgb(56, 189, 248)),
-                AppId::OxyPixel => ("▦", Color32::from_rgb(234, 179, 8)),
+        for (tab, label) in tabs {
+            let is_active = self.current_tab == tab;
+            let (bg, text_col) = if is_active {
+                (COLOR_BLUE_BRIGHT, Color32::WHITE)
+            } else {
+                (
+                    Color32::from_rgba_premultiplied(18, 38, 68, 140),
+                    COLOR_MUTED,
+                )
             };
 
-            ui.label(RichText::new(icon).size(36.0).color(color));
-            ui.add_space(10.0);
+            let btn = egui::Button::new(RichText::new(label).size(13.0).color(text_col).strong())
+                .fill(bg)
+                .corner_radius(CornerRadius::same(14))
+                .min_size(vec2(76.0, 28.0));
 
-            ui.vertical(|ui| {
-                ui.heading(
-                    RichText::new(app_id.display_name())
-                        .size(24.0)
-                        .color(Color32::WHITE)
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(app_id.tagline())
-                        .size(13.0)
-                        .color(Color32::from_rgb(160, 175, 195)),
-                );
-            });
+            if ui.add(btn).clicked() {
+                self.current_tab = tab;
+            }
+        }
+    }
 
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some(inst) = &installed {
-                    let has_update = latest_release.as_ref().is_some_and(|r| {
-                        if let Ok(latest_ver) = r.version() {
-                            latest_ver > inst.version
-                        } else {
-                            false
-                        }
-                    });
-
-                    if has_update {
-                        ui.colored_label(
-                            Color32::from_rgb(234, 179, 8),
-                            RichText::new("⚡ Update Available").strong(),
-                        );
-                    } else {
-                        ui.colored_label(
-                            Color32::from_rgb(34, 197, 94),
-                            RichText::new(format!("✓ Installed ({})", inst.version)).strong(),
-                        );
-                    }
-                } else {
-                    ui.colored_label(
-                        Color32::from_rgb(140, 150, 170),
-                        RichText::new("Not Installed"),
-                    );
-                }
-            });
-        });
-
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(16.0);
-
-        // 2. App Description & Features
+    /// App Store "Today" Editorial View with Hero Card
+    fn show_today_view(&mut self, ui: &mut egui::Ui) {
+        // Editorial Eyebrow & Headline
         ui.label(
-            RichText::new(app_id.description())
-                .size(13.5)
-                .color(Color32::from_rgb(200, 210, 225)),
+            RichText::new("TODAY • OXY CREATIVE PORTAL")
+                .color(COLOR_DIM)
+                .size(11.0)
+                .strong(),
+        );
+        ui.heading(
+            RichText::new("Discover & Launch")
+                .color(COLOR_TEXT)
+                .size(32.0)
+                .strong(),
+        );
+
+        ui.add_space(16.0);
+
+        // Hero Story Card (App Store style)
+        self.draw_hero_card(ui, AppId::OxyBrush);
+
+        ui.add_space(28.0);
+
+        // Secondary Story Card
+        ui.label(
+            RichText::new("FEATURED STUDIO TOOL")
+                .color(COLOR_DIM)
+                .size(11.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+        self.draw_hero_card(ui, AppId::OxyPixel);
+    }
+
+    /// All Tools Grid View
+    fn show_apps_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("OXY TOOLS REGISTRY")
+                .color(COLOR_DIM)
+                .size(11.0)
+                .strong(),
+        );
+        ui.heading(
+            RichText::new("Installed & Available Tools")
+                .color(COLOR_TEXT)
+                .size(28.0)
+                .strong(),
         );
 
         ui.add_space(20.0);
 
-        // 3. Status messages or errors
-        if let Some(err) = &card.error {
-            ui.label(
-                RichText::new(format!("⚠ {}", err))
-                    .color(Color32::from_rgb(239, 68, 68))
-                    .size(13.0),
-            );
-            ui.add_space(8.0);
-        } else if let Some(msg) = &card.status_message {
-            ui.label(
-                RichText::new(format!("ℹ {}", msg))
-                    .color(Color32::from_rgb(56, 189, 248))
-                    .size(13.0),
-            );
-            ui.add_space(8.0);
+        for &app_id in AppId::ALL {
+            self.draw_app_row_card(ui, app_id);
+            ui.add_space(14.0);
         }
+    }
 
-        // 4. Progress bar if installing
-        if card.is_installing {
-            if let Some(progress) = &card.progress {
-                let frac = match (progress.bytes_downloaded, progress.total_bytes) {
-                    (b, Some(tot)) if tot > 0 => (b as f32 / tot as f32).clamp(0.0, 1.0),
-                    _ => 0.0,
-                };
+    /// Dedicated Tool Detail Page
+    fn show_app_page(&mut self, ui: &mut egui::Ui, app_id: AppId) {
+        self.draw_hero_card(ui, app_id);
 
-                ui.add(egui::ProgressBar::new(frac).show_percentage().animate(true));
-                ui.label(
-                    RichText::new(&progress.message)
-                        .size(12.0)
-                        .color(Color32::from_rgb(180, 190, 210)),
-                );
-            } else {
-                ui.spinner();
-            }
-            ui.add_space(16.0);
-        }
+        ui.add_space(24.0);
+        let card = self.apps.get(&app_id).cloned().unwrap_or_default();
 
-        // 5. Version Card & Actions
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    if let Some(inst) = &installed {
-                        ui.label(
-                            RichText::new(format!("Installed Version: {}", inst.version))
-                                .size(13.0)
-                                .color(Color32::WHITE),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new("Installed Version: None")
-                                .size(13.0)
-                                .color(Color32::from_rgb(150, 160, 180)),
-                        );
-                    }
-
-                    if let Some(rel) = &latest_release {
-                        ui.label(
-                            RichText::new(format!(
-                                "Latest Release: {} {}",
-                                rel.tag_name,
-                                if rel.prerelease { "(Pre-release)" } else { "" }
-                            ))
-                            .size(12.0)
-                            .color(Color32::from_rgb(56, 189, 248)),
-                        );
-                    } else if card.is_fetching {
-                        ui.label(
-                            RichText::new("Checking for releases...")
-                                .size(12.0)
-                                .color(Color32::from_rgb(140, 150, 170)),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new("No compatible releases found")
-                                .size(12.0)
-                                .color(Color32::from_rgb(200, 120, 120)),
-                        );
-                    }
-                });
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(rel) = &latest_release {
-                        if ui.button("Release Notes").clicked() {
-                            self.release_notes_modal = Some((app_id, rel.clone()));
-                        }
-                    }
-                });
-            });
-
-            ui.add_space(16.0);
-
-            // Action Buttons
-            ui.horizontal(|ui| {
-                let has_update = match (&installed, &latest_release) {
-                    (Some(inst), Some(rel)) => {
-                        if let Ok(v) = rel.version() {
-                            v > inst.version
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
-
-                if card.is_installing {
-                    ui.add_enabled(
-                        false,
-                        egui::Button::new(RichText::new("Installing...").size(15.0).strong()),
-                    );
-                } else if let Some(_inst) = &installed {
-                    // Launch Button (Primary)
-                    let launch_btn = egui::Button::new(
-                        RichText::new("🚀 Launch App")
-                            .color(Color32::WHITE)
-                            .size(15.0)
-                            .strong(),
-                    )
-                    .fill(Color32::from_rgb(34, 197, 94))
-                    .min_size(vec2(140.0, 38.0));
-
-                    if ui.add(launch_btn).clicked() {
-                        self.launch_installed(app_id);
-                    }
-
-                    // If update available, show Update button
-                    if has_update {
-                        if let Some(rel) = latest_release.clone() {
-                            let update_btn = egui::Button::new(
-                                RichText::new(format!("⬆ Update to {}", rel.tag_name))
-                                    .color(Color32::WHITE)
-                                    .size(14.0),
-                            )
-                            .fill(Color32::from_rgb(56, 189, 248))
-                            .min_size(vec2(140.0, 38.0));
-
-                            if ui.add(update_btn).clicked() {
-                                self.start_install(app_id, rel);
-                            }
-                        }
-                    }
-
-                    // Directory button
-                    if ui.button("📂 Open Folder").clicked() {
-                        if let Some(inst) = &installed {
-                            Self::open_directory(&inst.install_dir);
-                        }
-                    }
-
-                    // Uninstall button
-                    if ui
-                        .button(RichText::new("Uninstall").color(Color32::from_rgb(239, 68, 68)))
-                        .clicked()
-                    {
-                        self.start_uninstall(app_id);
-                    }
-                } else if let Some(rel) = latest_release.clone() {
-                    // Install Button
-                    let install_btn = egui::Button::new(
-                        RichText::new(format!("📥 Install {}", rel.tag_name))
-                            .color(Color32::WHITE)
-                            .size(15.0)
-                            .strong(),
-                    )
-                    .fill(Color32::from_rgb(56, 189, 248))
-                    .min_size(vec2(160.0, 40.0));
-
-                    if ui.add(install_btn).clicked() {
-                        self.start_install(app_id, rel);
-                    }
-                } else {
-                    ui.add_enabled(
-                        false,
-                        egui::Button::new(RichText::new("Unavailable").size(14.0)),
-                    );
-                }
-            });
-
-            ui.add_space(6.0);
-        });
-
-        // 6. Recent Releases History Accordion
         if !card.releases.is_empty() {
-            ui.add_space(20.0);
-            ui.collapsing(
-                RichText::new("All Available Releases").size(14.0).strong(),
-                |ui| {
-                    for rel in &card.releases {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&rel.tag_name).monospace().strong().size(13.0));
+            ui.label(
+                RichText::new("VERSION HISTORY & RELEASES")
+                    .color(COLOR_DIM)
+                    .size(11.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
 
+            for rel in &card.releases {
+                Frame::NONE
+                    .fill(COLOR_BG_CARD)
+                    .stroke(Stroke::new(1.0_f32, COLOR_BORDER))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::symmetric(16, 12))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&rel.tag_name)
+                                    .color(COLOR_TEXT)
+                                    .monospace()
+                                    .strong()
+                                    .size(13.0),
+                            );
                             if rel.prerelease {
                                 ui.colored_label(
-                                    Color32::from_rgb(234, 179, 8),
+                                    COLOR_ORANGE_BRIGHT,
                                     RichText::new("pre-release").size(11.0),
                                 );
                             }
-
                             if let Some(date) = &rel.published_at {
-                                ui.label(
-                                    RichText::new(date)
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(130, 140, 160)),
-                                );
+                                ui.label(RichText::new(date).size(11.0).color(COLOR_DIM));
                             }
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -923,10 +792,442 @@ impl OxyStudioApp {
                                 }
                             });
                         });
-                        ui.separator();
+                    });
+                ui.add_space(6.0);
+            }
+        }
+    }
+
+    /// BozNetwork Liquid Glass Hero Card
+    fn draw_hero_card(&mut self, ui: &mut egui::Ui, app_id: AppId) {
+        let card = self.apps.get(&app_id).cloned().unwrap_or_default();
+        let installed = self.manifest.get(app_id).cloned();
+
+        let latest_release = card
+            .releases
+            .iter()
+            .find(|r| self.settings.allow_prereleases || !r.prerelease)
+            .cloned();
+
+        Frame::NONE
+            .fill(COLOR_BG_CARD)
+            .stroke(Stroke::new(1.0_f32, COLOR_BORDER_STRONG))
+            .corner_radius(CornerRadius::same(20))
+            .inner_margin(Margin::same(24))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Left: App Icon & Identity
+                    let (icon_symbol, accent_color) = match app_id {
+                        AppId::OxyBrush => ("🖌", COLOR_BLUE_BRIGHT),
+                        AppId::OxyPixel => ("▦", COLOR_ORANGE_BRIGHT),
+                    };
+
+                    Frame::NONE
+                        .fill(COLOR_BG_APPBAR)
+                        .stroke(Stroke::new(1.0_f32, COLOR_BORDER))
+                        .corner_radius(CornerRadius::same(18))
+                        .inner_margin(Margin::same(16))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(icon_symbol).size(38.0).color(accent_color));
+                        });
+
+                    ui.add_space(16.0);
+
+                    // Center: App Info & Story
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(match app_id {
+                                AppId::OxyBrush => "3D DIGITAL SCULPTING & TOPOLOGY",
+                                AppId::OxyPixel => "PIXEL ART, TILESETS & ANIMATION",
+                            })
+                            .color(COLOR_DIM)
+                            .size(11.0)
+                            .strong(),
+                        );
+
+                        ui.heading(
+                            RichText::new(app_id.display_name())
+                                .size(24.0)
+                                .color(COLOR_TEXT)
+                                .strong(),
+                        );
+
+                        ui.label(
+                            RichText::new(app_id.tagline())
+                                .size(13.0)
+                                .color(COLOR_MUTED),
+                        );
+                    });
+
+                    // Right: App Store Capsule Pill Button
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.draw_capsule_action_button(
+                            ui,
+                            app_id,
+                            &installed,
+                            &latest_release,
+                            &card,
+                        );
+                    });
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                // Body Description
+                ui.label(
+                    RichText::new(app_id.description())
+                        .size(13.0)
+                        .color(COLOR_MUTED),
+                );
+
+                ui.add_space(14.0);
+
+                // Progress Bar if installing
+                if card.is_installing {
+                    if let Some(progress) = &card.progress {
+                        let frac = match (progress.bytes_downloaded, progress.total_bytes) {
+                            (b, Some(tot)) if tot > 0 => (b as f32 / tot as f32).clamp(0.0, 1.0),
+                            _ => 0.0,
+                        };
+
+                        ui.add(egui::ProgressBar::new(frac).show_percentage().animate(true));
+                        ui.label(
+                            RichText::new(&progress.message)
+                                .size(12.0)
+                                .color(COLOR_BLUE_BRIGHT),
+                        );
+                    } else {
+                        ui.spinner();
                     }
-                },
+                    ui.add_space(10.0);
+                }
+
+                // Status message or location details
+                ui.horizontal(|ui| {
+                    if let Some(inst) = &installed {
+                        ui.label(
+                            RichText::new("● INSTALLED")
+                                .color(COLOR_GREEN_STATUS)
+                                .size(11.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(format!("v{}", inst.version))
+                                .color(COLOR_TEXT)
+                                .size(11.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(format!("({})", inst.executable_path.display()))
+                                .color(COLOR_DIM)
+                                .monospace()
+                                .size(10.5),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("○ NOT INSTALLED")
+                                .color(COLOR_DIM)
+                                .size(11.0)
+                                .strong(),
+                        );
+                        if let Some(rel) = &latest_release {
+                            ui.label(
+                                RichText::new(format!("Latest: {}", rel.tag_name))
+                                    .color(COLOR_BLUE_BRIGHT)
+                                    .size(11.0),
+                            );
+                        }
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if installed.is_some() {
+                            if ui
+                                .button(RichText::new("📂 Open Folder").size(11.5))
+                                .clicked()
+                            {
+                                if let Some(inst) = &installed {
+                                    Self::open_directory(&inst.install_dir);
+                                }
+                            }
+
+                            if ui.button(RichText::new("🔍 Relocate").size(11.5)).clicked() {
+                                self.locate_app_manually(app_id);
+                            }
+
+                            if let Some(inst) = &installed {
+                                let is_managed = !inst.tag.starts_with("detected")
+                                    && !inst.tag.starts_with("manual");
+                                if is_managed {
+                                    if ui
+                                        .button(
+                                            RichText::new("Uninstall")
+                                                .color(COLOR_RED_STATUS)
+                                                .size(11.5),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.start_uninstall(app_id);
+                                    }
+                                } else if ui
+                                    .button(
+                                        RichText::new("Unlink").color(COLOR_RED_STATUS).size(11.5),
+                                    )
+                                    .clicked()
+                                {
+                                    self.unlink_app(app_id);
+                                }
+                            }
+                        } else {
+                            if ui
+                                .button(RichText::new("🔍 Locate Existing App").size(11.5))
+                                .clicked()
+                            {
+                                self.locate_app_manually(app_id);
+                            }
+                        }
+
+                        if let Some(rel) = &latest_release {
+                            if ui.button(RichText::new("Notes").size(11.5)).clicked() {
+                                self.release_notes_modal = Some((app_id, rel.clone()));
+                            }
+                        }
+                    });
+                });
+            });
+    }
+
+    /// Inset Grouped Row Card for All Tools List
+    fn draw_app_row_card(&mut self, ui: &mut egui::Ui, app_id: AppId) {
+        let card = self.apps.get(&app_id).cloned().unwrap_or_default();
+        let installed = self.manifest.get(app_id).cloned();
+        let latest_release = card
+            .releases
+            .iter()
+            .find(|r| self.settings.allow_prereleases || !r.prerelease)
+            .cloned();
+
+        Frame::NONE
+            .fill(COLOR_BG_CARD)
+            .stroke(Stroke::new(1.0_f32, COLOR_BORDER))
+            .corner_radius(CornerRadius::same(16))
+            .inner_margin(Margin::symmetric(20, 16))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let icon_sym = match app_id {
+                        AppId::OxyBrush => "🖌",
+                        AppId::OxyPixel => "▦",
+                    };
+                    ui.label(RichText::new(icon_sym).size(26.0).color(COLOR_BLUE_BRIGHT));
+                    ui.add_space(10.0);
+
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(app_id.display_name())
+                                    .size(16.0)
+                                    .color(COLOR_TEXT)
+                                    .strong(),
+                            );
+                            if let Some(inst) = &installed {
+                                ui.label(
+                                    RichText::new(format!("v{}", inst.version))
+                                        .color(COLOR_GREEN_STATUS)
+                                        .size(12.0)
+                                        .strong(),
+                                );
+                            }
+                        });
+                        ui.label(
+                            RichText::new(app_id.tagline())
+                                .size(12.0)
+                                .color(COLOR_MUTED),
+                        );
+                    });
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.draw_capsule_action_button(
+                            ui,
+                            app_id,
+                            &installed,
+                            &latest_release,
+                            &card,
+                        );
+                    });
+                });
+            });
+    }
+
+    /// App Store Pill / Capsule Button (GET / OPEN / UPDATE)
+    fn draw_capsule_action_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        app_id: AppId,
+        installed: &Option<oxystudio_core::InstalledApp>,
+        latest_release: &Option<Release>,
+        card: &AppCardState,
+    ) {
+        let has_update = match (installed, latest_release) {
+            (Some(inst), Some(rel)) => {
+                if let Ok(v) = rel.version() {
+                    v > inst.version
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        if card.is_installing {
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new("INSTALLING").size(13.0).strong())
+                    .corner_radius(CornerRadius::same(16))
+                    .min_size(vec2(100.0, 34.0)),
+            );
+        } else if let Some(_inst) = installed {
+            if has_update {
+                if let Some(rel) = latest_release.clone() {
+                    let btn = egui::Button::new(
+                        RichText::new("UPDATE")
+                            .color(Color32::WHITE)
+                            .size(13.0)
+                            .strong(),
+                    )
+                    .fill(COLOR_ORANGE_BRIGHT)
+                    .corner_radius(CornerRadius::same(16))
+                    .min_size(vec2(92.0, 34.0));
+
+                    if ui.add(btn).clicked() {
+                        self.start_install(app_id, rel);
+                    }
+                }
+            }
+
+            let open_btn = egui::Button::new(
+                RichText::new("OPEN")
+                    .color(Color32::WHITE)
+                    .size(13.0)
+                    .strong(),
+            )
+            .fill(COLOR_BLUE_BRIGHT)
+            .corner_radius(CornerRadius::same(16))
+            .min_size(vec2(86.0, 34.0));
+
+            if ui.add(open_btn).clicked() {
+                self.launch_installed(app_id);
+            }
+        } else if let Some(rel) = latest_release.clone() {
+            let get_btn = egui::Button::new(
+                RichText::new("GET")
+                    .color(Color32::WHITE)
+                    .size(13.0)
+                    .strong(),
+            )
+            .fill(Color32::from_rgb(18, 60, 110))
+            .stroke(Stroke::new(1.0_f32, COLOR_BLUE_BRIGHT))
+            .corner_radius(CornerRadius::same(16))
+            .min_size(vec2(86.0, 34.0));
+
+            if ui.add(get_btn).clicked() {
+                self.start_install(app_id, rel);
+            }
+        } else {
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new("GET").size(13.0))
+                    .corner_radius(CornerRadius::same(16)),
             );
         }
+    }
+
+    /// Settings View
+    fn show_settings_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("CONFIGURATION & PREFERENCES")
+                .color(COLOR_DIM)
+                .size(11.0)
+                .strong(),
+        );
+        ui.heading(
+            RichText::new("Portal Settings")
+                .color(COLOR_TEXT)
+                .size(28.0)
+                .strong(),
+        );
+
+        ui.add_space(20.0);
+
+        Frame::NONE
+            .fill(COLOR_BG_CARD)
+            .stroke(Stroke::new(1.0_f32, COLOR_BORDER))
+            .corner_radius(CornerRadius::same(18))
+            .inner_margin(Margin::same(24))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Release Channels")
+                        .size(16.0)
+                        .color(COLOR_TEXT)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                if ui
+                    .checkbox(
+                        &mut self.settings.allow_prereleases,
+                        "Include Pre-releases (Alphas, Betas, Release Candidates)",
+                    )
+                    .changed()
+                {
+                    self.settings.save();
+                }
+
+                ui.add_space(14.0);
+                if ui
+                    .checkbox(
+                        &mut self.settings.auto_check_updates,
+                        "Check for updates automatically on start",
+                    )
+                    .changed()
+                {
+                    self.settings.save();
+                }
+
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(16.0);
+
+                ui.label(
+                    RichText::new("Managed Installation Directory")
+                        .size(16.0)
+                        .color(COLOR_TEXT)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                let (default_apps, _) = Installer::default_paths();
+                let current_dir = self
+                    .settings
+                    .custom_apps_dir
+                    .clone()
+                    .unwrap_or(default_apps);
+
+                ui.label(
+                    RichText::new(current_dir.display().to_string())
+                        .color(COLOR_MUTED)
+                        .monospace()
+                        .size(12.0),
+                );
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("📂 Open Apps Folder").clicked() {
+                        Self::open_directory(&current_dir);
+                    }
+
+                    if ui.button("🔍 Run System Auto-Discovery").clicked() {
+                        self.scan_system_for_installed_apps();
+                    }
+                });
+            });
     }
 }

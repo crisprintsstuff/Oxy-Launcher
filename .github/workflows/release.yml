@@ -1,0 +1,121 @@
+name: Release builds
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      numeric: ${{ steps.v.outputs.numeric }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read version from Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          numeric="${version%%-*}.0"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "numeric=$numeric" >> "$GITHUB_OUTPUT"
+          echo "Version $version (numeric $numeric)"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows binary
+        run: cargo build --release -p oxystudio --target x86_64-pc-windows-msvc
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=${{ needs.version.outputs.version }} `
+            /DNumericVersion=${{ needs.version.outputs.numeric }} `
+            /DSourceDir=target\x86_64-pc-windows-msvc\release `
+            packaging\windows\oxystudio.iss
+
+      - name: Stage Windows Portable Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $zipName = "dist/OxyStudio-${{ needs.version.outputs.version }}-windows-x86_64.zip"
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/oxystudio.exe, README.md, LICENSE -DestinationPath $zipName
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxystudio-windows
+          path: dist/*
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev libwayland-dev libxkbcommon-dev
+
+      - name: Build Linux binary
+        run: cargo build --release -p oxystudio --target x86_64-unknown-linux-gnu
+
+      - name: Package Linux tarball
+        run: |
+          mkdir -p dist
+          tar_name="OxyStudio-${{ needs.version.outputs.version }}-linux-x86_64"
+          mkdir -p "dist/$tar_name"
+          cp target/x86_64-unknown-linux-gnu/release/oxystudio README.md LICENSE "dist/$tar_name/"
+          tar -C dist -czf "dist/$tar_name.tar.gz" "$tar_name"
+          rm -r "dist/$tar_name"
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxystudio-linux
+          path: dist/*
+
+  publish:
+    needs: [version, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: oxystudio-windows
+          path: dist
+      - name: Download Linux Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: oxystudio-linux
+          path: dist
+      - name: Compute Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Attach release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
