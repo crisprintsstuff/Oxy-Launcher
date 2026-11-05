@@ -68,7 +68,15 @@ impl AppDetector {
 
     /// Extract version by invoking `<binary> --version`
     pub fn probe_version(exe_path: &Path) -> Option<Version> {
-        let output = Command::new(exe_path).arg("--version").output().ok()?;
+        let mut cmd = Command::new(exe_path);
+        cmd.arg("--version");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = cmd.output().ok()?;
 
         if !output.status.success() {
             return None;
@@ -313,10 +321,13 @@ impl AppDetector {
 
     #[cfg(target_os = "windows")]
     fn query_registry_value(key: &str, value_name: &str) -> Option<String> {
-        let output = Command::new("reg")
-            .args(["query", key, "/v", value_name])
-            .output()
-            .ok()?;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let mut cmd = Command::new("reg");
+        cmd.args(["query", key, "/v", value_name]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = cmd.output().ok()?;
 
         if !output.status.success() {
             return None;
