@@ -1,4 +1,4 @@
-.PHONY: test check release fmt
+.PHONY: test check release windows installer fmt
 
 test:
 	cargo test --workspace
@@ -13,3 +13,9 @@ check:
 
 release:
 	cargo build --workspace --release
+
+windows:
+	./scripts/build-windows.sh
+
+installer:
+	./scripts/build-installer.sh
